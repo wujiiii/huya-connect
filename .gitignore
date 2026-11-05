@@ -1,0 +1,16 @@
+target/
+.release/
+captures/
+*.log
+.playwright-cli/
+output/playwright/
+
+# Local capture exports can contain viewer identities and payment identifiers.
+/output/gift-message-catalog-*.json
+
+# Regenerable video outputs, tool state, and nested export copies.
+/videos/huya-anonymous-frame-decoding/.hyperframes/
+/videos/huya-anonymous-frame-decoding/.thumbnails/
+/videos/huya-anonymous-frame-decoding/renders/
+/videos/huya-anonymous-frame-decoding/snapshots/
+/videos/huya-anonymous-frame-decoding/videos/

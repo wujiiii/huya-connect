@@ -1,0 +1,15 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent><groupId>io.github.wujiiii</groupId><artifactId>huya-connect-parent</artifactId><version>0.1.0</version></parent>
+  <artifactId>huya-connect-sdk</artifactId>
+  <name>huya-connect-sdk</name>
+  <description>Anonymous Huya WebSocket client, bounded JCE/WUP decoding, ordered callbacks, recording and offline replay.</description>
+  <build><resources>
+    <resource><directory>src/main/resources</directory></resource>
+    <resource><directory>..</directory><targetPath>META-INF</targetPath><includes><include>LICENSE</include></includes></resource>
+  </resources></build>
+  <dependencies>
+    <dependency><groupId>com.fasterxml.jackson.core</groupId><artifactId>jackson-databind</artifactId><version>2.17.2</version></dependency>
+    <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>5.11.4</version><scope>test</scope></dependency>
+  </dependencies>
+</project>
