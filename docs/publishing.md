@@ -1,6 +1,6 @@
 # Maven Central 发布
 
-正式SDK坐标为 `io.github.wujiiii:huya-connect-sdk:0.1.1`，Java包名保持 `dev.huya.connect.sdk`。Apache-2.0许可证见根目录LICENSE。
+正式SDK坐标为 `io.github.wujiiii:huya-connect-sdk:0.1.2`，Java包名保持 `dev.huya.connect.sdk`。Apache-2.0许可证见根目录LICENSE。
 
 只发布父POM与SDK，不发布采集Demo或OrdinaryRoad依赖：
 

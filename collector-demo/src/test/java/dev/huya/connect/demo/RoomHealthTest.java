@@ -42,6 +42,19 @@ class RoomHealthTest {
         assertEquals(1L, snapshot.get("decodeErrors")); assertEquals(true, snapshot.get("healthy"));
         assertFalse(snapshot.containsKey("senderName"));
     }
+    @Test void reconnectDiagnosticsStayBoundedAndPersistAfterRecovery(@TempDir Path root) throws Exception {
+        RoomHealth health = new RoomHealth();
+        for (int i = 0; i < 40; i++) health.onConnectionDiagnostic(new dev.huya.connect.sdk.HuyaConnectionDiagnostic(
+                "527988", "1199568157971", "connection-" + i, Instant.now().toString(), 0,
+                "WebSocket closed: 1012", 1012, List.of("java.io.IOException"), 20L, 30L, 2000));
+        var snapshot = health.snapshot(status(HuyaStatus.State.RUNNING), Instant.now());
+        var diagnostics = (List<?>) snapshot.get("connectionDiagnostics");
+        assertEquals(32, diagnostics.size());
+        Path file = root.resolve("status.json"); CollectorDemo.atomicJson(file, snapshot);
+        String json = Files.readString(file);
+        assertTrue(json.contains("connection-8")); assertTrue(json.contains("connection-39"));
+        assertFalse(json.contains("connection-7\"")); assertTrue(json.contains("1012"));
+    }
     @Test void atomicStatusCanBeReplacedAndTargetsStayPinned(@TempDir Path root) throws Exception {
         Path file = root.resolve("status.json");
         CollectorDemo.atomicJson(file, Map.of("version", 1)); CollectorDemo.atomicJson(file, Map.of("version", 2));

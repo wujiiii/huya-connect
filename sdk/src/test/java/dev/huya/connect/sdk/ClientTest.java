@@ -69,6 +69,61 @@ class ClientTest {
             assertTrue(Files.size(directory.resolve("raw-0001.ndjson")) > 0);
         }
     }
+    @Test void stableRecoveryRotatesEndpointsAndKeepsSanitizedCloseDiagnostics() throws Exception {
+        CountDownLatch thirdConnection = new CountDownLatch(1), diagnosed = new CountDownLatch(2);
+        List<HuyaConnectionDiagnostic> diagnostics = new CopyOnWriteArrayList<>();
+        List<Integer> endpoints = new CopyOnWriteArrayList<>();
+        java.util.concurrent.atomic.AtomicReference<HuyaClient> ref = new java.util.concurrent.atomic.AtomicReference<>();
+        LocalWebSocket.Scenario scenario = (peer, n) -> {
+            ready(peer);
+            for (int i = 0; i < 5; i++) peer.read();
+            // Simulate a connection older than the stable-reset threshold without waiting three minutes.
+            var current = HuyaClient.class.getDeclaredField("current"); current.setAccessible(true);
+            Object connection = current.get(ref.get());
+            var opened = connection.getClass().getDeclaredField("opened"); opened.setAccessible(true);
+            opened.setLong(connection, System.nanoTime() - TimeUnit.MINUTES.toNanos(4));
+            if (endpoints.size() < 3) {
+                peer.send(Protocol.command(21, new byte[0], 0));
+                peer.closeFrame(1012, "secret=https://private.invalid/?token=hidden");
+            } else { thirdConnection.countDown(); peer.consume(); }
+        };
+        try (var first = new LocalWebSocket((peer, n) -> { endpoints.add(0); scenario.run(peer, n); });
+             var second = new LocalWebSocket((peer, n) -> { endpoints.add(1); scenario.run(peer, n); });
+             var client = builder(first).transport(List.of(first.uri(), second.uri()), 1000, 1000, 2000)
+                     .listener(new HuyaListener() {
+                         @Override public void onConnectionDiagnostic(HuyaConnectionDiagnostic d) { diagnostics.add(d); diagnosed.countDown(); }
+                     }).build()) {
+            ref.set(client); client.start().get(3, TimeUnit.SECONDS);
+            assertTrue(thirdConnection.await(5, TimeUnit.SECONDS));
+            assertTrue(diagnosed.await(3, TimeUnit.SECONDS));
+            assertEquals(List.of(0, 1, 0), endpoints);
+            assertEquals(2, diagnostics.size());
+            for (int i = 0; i < 2; i++) {
+                var d = diagnostics.get(i);
+                assertEquals(i, d.endpointIndex()); assertEquals(1012, d.closeCode());
+                assertEquals(20, d.retryDelayMillis()); assertNotNull(d.lastHeartbeatReplyAgeMillis());
+                assertFalse(d.toString().contains("secret")); assertFalse(d.toString().contains("hidden"));
+            }
+        }
+    }
+    @Test void transportFailureRetainsCauseWithoutCopyingItsMessageToDiagnostic() throws Exception {
+        CountDownLatch diagnosed = new CountDownLatch(1);
+        List<Throwable> errors = new CopyOnWriteArrayList<>();
+        List<HuyaConnectionDiagnostic> diagnostics = new CopyOnWriteArrayList<>();
+        try (var server = new LocalWebSocket((peer, n) -> { ready(peer); });
+             var client = builder(server).listener(new HuyaListener() {
+                 @Override public void onError(Throwable e) { errors.add(e); }
+                 @Override public void onConnectionDiagnostic(HuyaConnectionDiagnostic d) {
+                     diagnostics.add(d); diagnosed.countDown();
+                 }
+             }).build()) {
+            client.start(); assertTrue(diagnosed.await(4, TimeUnit.SECONDS));
+            assertTrue(errors.stream().anyMatch(e -> e.getCause() != null));
+            assertTrue(diagnostics.get(0).causeTypes().size() >= 2);
+        }
+        var error = new java.io.IOException("https://private.invalid/?token=hidden", new IllegalStateException("secret"));
+        assertEquals(List.of("java.io.IOException", "java.lang.IllegalStateException"), HuyaConnectionDiagnostic.causeTypes(error));
+    }
     @Test void registrationAndReceiveTimeoutRetryInsteadOfClaimingRunning() throws Exception {
         for (boolean registered : new boolean[]{false, true}) {
             CountDownLatch reconnected = new CountDownLatch(1);

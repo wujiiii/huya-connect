@@ -49,7 +49,7 @@ public final class HuyaClient implements AutoCloseable {
     private volatile Thread callbackThread;
     private String presenterUid;
     private long sequence;
-    private int failures;
+    private int failures, nextEndpoint;
     private boolean launched;
     private final EnumMap<RoomQueries.Kind, HuyaQueryResult<?>> roomValues = new EnumMap<>(RoomQueries.Kind.class);
 
@@ -210,16 +210,18 @@ public final class HuyaClient implements AutoCloseable {
             if (presenterUid == null) presenterUid = resolve();
             if (stopped) return;
             var connection = new Connection(); current = connection; resetRoomInfo(connection, "New connection; not queried");
-            URI endpoint = options.endpoints.get(failures % options.endpoints.size());
+            connection.endpointIndex = nextEndpoint;
+            URI endpoint = options.endpoints.get(nextEndpoint);
+            nextEndpoint = (nextEndpoint + 1) % options.endpoints.size();
             http.newWebSocketBuilder().connectTimeout(Duration.ofSeconds(15))
                     .header("Origin", "https://www.huya.com")
                     .buildAsync(Protocol.connectUrl(endpoint, connection.guid), connection)
                     .whenComplete((socket, error) -> {
-                        if (error != null) execute(() -> recover(connection, new IOException("WebSocket connection failed")));
+                        if (error != null) execute(() -> recover(connection, new IOException("WebSocket connection failed", error)));
                         else if (stopped || current != connection) socket.abort();
                     });
         } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        catch (Exception e) { recover(current, new IOException("Room metadata resolution failed: " + e.getClass().getSimpleName())); }
+        catch (Exception e) { recover(current, new IOException("Room metadata resolution failed: " + e.getClass().getSimpleName(), e)); }
     }
     private String resolve() throws IOException, InterruptedException {
         HttpRequest request = HttpRequest.newBuilder(URI.create("https://www.huya.com/" + options.roomId))
@@ -251,7 +253,7 @@ public final class HuyaClient implements AutoCloseable {
             else if (elapsed(now, c.lastHeartbeat) >= options.heartbeatMillis) {
                 send(c, Protocol.command(20, new byte[0], 0)); c.lastHeartbeat = now;
             }
-        } catch (Exception e) { recover(current, new IOException("Heartbeat processing failed")); }
+        } catch (Exception e) { recover(current, new IOException("Heartbeat processing failed", e)); }
     }
     private static long elapsed(long now, long then) { return TimeUnit.NANOSECONDS.toMillis(now - then); }
     private void send(Connection c, byte[] bytes) {
@@ -261,7 +263,7 @@ public final class HuyaClient implements AutoCloseable {
         c.outgoing = c.outgoing.thenCompose(ignored -> c.socket.sendBinary(ByteBuffer.wrap(bytes), true))
                 .thenApply(ignored -> (Void) null);
         c.outgoing.whenComplete((socket, error) -> {
-            if (error != null) execute(() -> recover(c, new IOException("WebSocket send failed")));
+            if (error != null) execute(() -> recover(c, new IOException("WebSocket send failed", error)));
         });
     }
     private synchronized void accept(Connection c, String direction, String type, byte[] bytes) {
@@ -276,6 +278,7 @@ public final class HuyaClient implements AutoCloseable {
                 for (HuyaEvent event : events) {
                     if (event instanceof HuyaEvent.Command command) {
                         c.lastResponse = System.nanoTime();
+                        if (command.opcode() == 21) c.lastHeartbeatReply = c.lastResponse;
                         if (command.opcode() == 17) execute(() -> registration(c, command));
                     }
                     if (event instanceof HuyaEvent.Snapshot snapshot) execute(() -> queryResponse(c, snapshot));
@@ -309,7 +312,7 @@ public final class HuyaClient implements AutoCloseable {
             beginQuery(c, RoomQueries.Kind.GIFTS, 101);
             for (RoomQueries.Kind kind : RoomQueries.Kind.values())
                 if (kind != RoomQueries.Kind.GIFTS) beginQuery(c, kind, c.nextRequest++);
-        } catch (RuntimeException e) { recover(c, new IOException("Invalid registration response")); }
+        } catch (RuntimeException e) { recover(c, new IOException("Invalid registration response", e)); }
     }
     private synchronized void recover(Connection c, Throwable error) {
         if (stopped || current != c) return;
@@ -321,6 +324,13 @@ public final class HuyaClient implements AutoCloseable {
         transition(State.BACKOFF, error.getMessage());
         long delay = Math.min(60_000, options.backoffMillis * (1L << Math.min(failures - 1, 6)));
         if (options.jitter) delay += java.util.concurrent.ThreadLocalRandom.current().nextLong(1000);
+        long now = System.nanoTime();
+        var diagnostic = new HuyaConnectionDiagnostic(options.roomId, presenterUid, c == null ? null : c.id,
+                Instant.now().toString(), c == null ? null : c.endpointIndex, error.getMessage(),
+                c == null ? null : c.closeCode, HuyaConnectionDiagnostic.causeTypes(error),
+                c == null || c.socket == null ? null : elapsed(now, c.lastResponse),
+                c == null || c.lastHeartbeatReply == 0 ? null : elapsed(now, c.lastHeartbeatReply), delay);
+        dispatch(() -> invoke(() -> options.listener.onConnectionDiagnostic(diagnostic)));
         if (!stopped) control.schedule(this::connect, delay, TimeUnit.MILLISECONDS);
     }
     private synchronized void transition(State state, String detail) {
@@ -396,7 +406,9 @@ public final class HuyaClient implements AutoCloseable {
         final ByteArrayOutputStream binary = new ByteArrayOutputStream();
         final StringBuilder text = new StringBuilder();
         volatile WebSocket socket;
-        volatile long opened, lastResponse, lastHeartbeat;
+        volatile long opened, lastResponse, lastHeartbeat, lastHeartbeatReply;
+        int endpointIndex;
+        Integer closeCode;
         volatile boolean registered;
         int nextRequest = 1000;
         final EnumMap<RoomQueries.Kind, Pending> pending = new EnumMap<>(RoomQueries.Kind.class);
@@ -430,10 +442,10 @@ public final class HuyaClient implements AutoCloseable {
             socket.request(1); return null;
         }
         @Override public CompletionStage<?> onClose(WebSocket socket, int code, String reason) {
-            execute(() -> recover(this, new IOException("WebSocket closed: " + code))); return null;
+            execute(() -> { closeCode = code; recover(this, new IOException("WebSocket closed: " + code)); }); return null;
         }
         @Override public void onError(WebSocket socket, Throwable error) {
-            execute(() -> recover(this, new IOException("WebSocket receive failed")));
+            execute(() -> recover(this, new IOException("WebSocket receive failed", error)));
         }
     }
     public static final class Builder {

@@ -16,7 +16,7 @@ mvn -pl sdk -am clean install
 <dependency>
     <groupId>io.github.wujiiii</groupId>
     <artifactId>huya-connect-sdk</artifactId>
-    <version>0.1.1</version>
+    <version>0.1.2</version>
 </dependency>
 ```
 
@@ -24,7 +24,7 @@ SDK 运行时仅依赖 Jackson；HTTP/WebSocket 使用 JDK。SDK 不携带日志
 
 ## 房间数据查询（0.1.1新增）
 
-以下API自0.1.1提供，0.1.0不包含这些接口。Maven依赖使用上方的`io.github.wujiiii:huya-connect-sdk:0.1.1`，Java包名不变。
+以下API自0.1.1提供，0.1.0不包含这些接口。Maven依赖使用上方的`io.github.wujiiii:huya-connect-sdk:0.1.2`，Java包名不变。
 
 核心组注册成功后，SDK自动执行以下查询；每次重连重新查询。`start()`仍只等待核心组注册，不等待这些查询完成。
 
@@ -179,6 +179,20 @@ URI 3102 的消息体使用 JSON，SDK在统一 `Message` 中将它命名为 `Su
 
 ## 回调、错误和停止
 
+### 重连诊断（0.1.2新增）
+
+源码新增 `HuyaListener.onConnectionDiagnostic(HuyaConnectionDiagnostic)`，每次自动重连交付一次脱敏诊断：房间/主播UID、旧连接ID、ISO-8601 UTC时间、零起点端点序号、触发阶段、可空WebSocket关闭码、最多8层异常类型、最近有效协议响应/20→21保活响应距故障的毫秒数及重试等待毫秒数。未收到保活响应时对应间隔为null。端点序号对应配置顺序，默认0为 `wsapi.huya.com`、1为 `cdnws.api.huya.com`；每次连接尝试轮换端点，稳定运行后的退避重置不再影响轮换。
+
+```java
+@Override public void onConnectionDiagnostic(HuyaConnectionDiagnostic diagnostic) {
+    System.out.println(diagnostic); // 仅脱敏元数据；不要在这里输出原始报文
+}
+```
+
+诊断不含连接URL、查询参数、异常消息原文或服务器关闭原因原文。`onError`保留真实异常的cause，应用自行处理时应脱敏。该回调使用既有顺序回调队列，应快速返回。Collector Demo每2秒发布的 `status.json` 在各房间的 `connectionDiagnostics` 中保留最近32次诊断，即使恢复RUNNING仍保留，超出32次淘汰最旧项；它是当前进程的有界诊断窗口，不是跨进程永久审计日志。进程在下一次状态写盘前退出时，最新记录可能尚未落盘。
+
+该回调与端点轮换修复自 **0.1.2** 提供，0.1.1及之前版本不包含。构建不会替换独立运行包；正在运行的采集需后续安排升级才会获得这些诊断。重连仍无法补发断线期间的历史消息，也不能保证消除服务端断开或网络故障。
+
 回调按房间顺序在该实例的独立线程执行；保活、注册和重连不等待业务回调。默认缓冲256个交付任务，可用 `callbackCapacity(int)` 调整。回调应快速返回，耗时业务应自行交给业务队列。回调抛出的异常交给 `onError`，后续事件继续交付；`onError` 自身抛错会被隔离，避免递归。
 
 缓冲溢出或录制失败会停止当前实例，状态变为 `FAILED`，不静默丢弃后继续假装健康。队列已有回调排空后交付最终错误和状态；业务回调一直阻塞时，最终通知也会等待，`status()` 可立即查看故障。`close()` 幂等，关闭网络与录制，并在非回调线程最多等待5秒排空回调；回调中关闭不会等待自身。所有自有线程均为后台线程，业务进程需要自行保持运行。
@@ -213,7 +227,7 @@ long frames = Replay.read(Path.of("captures/new-session"), listener);
 
 `payTotalRaw`、数量和支付类型均为协议原值，不等于用户实际现金支出或主播收益。SDK 不自动去重、不按收礼对象过滤、不套用研究项目核算候选规则。不得将统一消息与业务事件重复累加。公开协议可能变化，平台未下发和断网期间的消息不保证完整或可补齐。
 
-本地测试、独立消费项目和两个房间的同窗对照结果见[首版验证报告](docs/sdk-validation-20261103.md)。
+本地测试、独立消费项目和两个房间的同窗对照结果见首版验证报告（历史本地报告，不随源码发布）。
 
 以下保留原有旧 Demo 使用说明；其 Java 源码、资源和测试现在位于 `legacy-demo`。
 

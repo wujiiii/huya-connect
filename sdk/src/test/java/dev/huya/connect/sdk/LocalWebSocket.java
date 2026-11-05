@@ -75,6 +75,11 @@ final class LocalWebSocket implements AutoCloseable {
             else { out.write(126); out.write(data.length >>> 8); out.write(data.length & 255); }
             out.write(data); out.flush();
         }
+        synchronized void closeFrame(int code, String reason) throws IOException {
+            byte[] text = reason.getBytes(StandardCharsets.UTF_8);
+            var out = socket.getOutputStream(); out.write(136); out.write(text.length + 2);
+            out.write(code >>> 8); out.write(code & 255); out.write(text); out.flush();
+        }
         void ack(int request, int code) throws IOException {
             send(Protocol.command(17, Jce.integer(0, code), request));
         }

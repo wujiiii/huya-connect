@@ -1,6 +1,9 @@
 package dev.huya.connect.demo;
 
 import dev.huya.connect.sdk.HuyaEvent;
+import dev.huya.connect.sdk.HuyaConnectionDiagnostic;
+import java.util.ArrayDeque;
+import java.util.List;
 import dev.huya.connect.sdk.HuyaListener;
 import dev.huya.connect.sdk.HuyaStatus;
 import dev.huya.connect.sdk.RawFrame;
@@ -14,6 +17,7 @@ import java.util.TreeMap;
 /** Only operational counters go into status.json; viewer content remains in SDK recordings. */
 final class RoomHealth implements HuyaListener {
     private long received, sent, pushes, danmu, gifts, subscriptionCounts, decodeErrors, errors, reconnects;
+    private final ArrayDeque<HuyaConnectionDiagnostic> connectionDiagnostics = new ArrayDeque<>();
     private long sequence;
     private Instant lastReceived, lastProtocol, lastWrite, lastHeartbeatReply;
     private String lastErrorType, lastDecodeError;
@@ -47,6 +51,10 @@ final class RoomHealth implements HuyaListener {
     @Override public synchronized void onStatus(HuyaStatus status) {
         if (status.state() == HuyaStatus.State.BACKOFF) reconnects++;
     }
+    @Override public synchronized void onConnectionDiagnostic(HuyaConnectionDiagnostic diagnostic) {
+        if (connectionDiagnostics.size() == 32) connectionDiagnostics.removeFirst();
+        connectionDiagnostics.addLast(diagnostic);
+    }
     @Override public synchronized void onError(Throwable error) {
         errors++; lastErrorType = error.getClass().getSimpleName();
     }
@@ -64,6 +72,7 @@ final class RoomHealth implements HuyaListener {
         row.put("subscriptionCounts", subscriptionCounts); row.put("decodeErrors", decodeErrors);
         row.put("errors", errors); row.put("reconnects", reconnects); row.put("lastErrorType", lastErrorType);
         row.put("lastDecodeError", lastDecodeError); row.put("uriCounts", new TreeMap<>(uriCounts));
+        row.put("connectionDiagnostics", List.copyOf(connectionDiagnostics));
         row.put("snapshots", new TreeMap<>(snapshots));
         return row;
     }
