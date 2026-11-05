@@ -18,7 +18,8 @@ import static org.junit.jupiter.api.Assertions.*;
 class ClientTest {
     @TempDir Path directory;
     private static HuyaClient.Builder builder(LocalWebSocket server) {
-        return HuyaClient.builder("456").presenterUid("123").transport(List.of(server.uri()), 40, 250, 400);
+        return HuyaClient.builder("456").presenterUid("123").transport(List.of(server.uri()), 40, 250, 400)
+                .followerEndpoint(java.net.URI.create("http://127.0.0.1:1/followers"));
     }
     private static int opcode(byte[] data) { return (int) number(Jce.decode(data), 0, -1); }
     private static void ready(LocalWebSocket.Peer peer) throws Exception {
@@ -53,7 +54,7 @@ class ClientTest {
         List<HuyaEvent.Message> messages = new CopyOnWriteArrayList<>();
         try (var server = new LocalWebSocket((peer, n) -> {
             ready(peer);
-            for (int i = 0; i < 2; i++) { assertEquals(3, opcode(peer.read())); queries.incrementAndGet(); }
+            for (int i = 0; i < 5; i++) { assertEquals(3, opcode(peer.read())); queries.incrementAndGet(); }
             peer.send(ProtocolTest.v1(999999, n, integer(17, 42)));
             if (n == 1) return;
             peer.consume();
@@ -63,7 +64,7 @@ class ClientTest {
             }
         }).recording(directory).build()) {
             client.start().get(3, TimeUnit.SECONDS); assertTrue(second.await(3, TimeUnit.SECONDS));
-            assertEquals(4, queries.get()); assertNotEquals(messages.get(0).raw().connectionId(), messages.get(1).raw().connectionId());
+            assertEquals(10, queries.get()); assertNotEquals(messages.get(0).raw().connectionId(), messages.get(1).raw().connectionId());
             assertEquals(List.of("1", "2"), messages.stream().map(HuyaEvent.Message::messageId).toList());
             assertTrue(Files.size(directory.resolve("raw-0001.ndjson")) > 0);
         }

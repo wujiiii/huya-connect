@@ -16,11 +16,78 @@ mvn -pl sdk -am clean install
 <dependency>
     <groupId>io.github.wujiiii</groupId>
     <artifactId>huya-connect-sdk</artifactId>
-    <version>0.1.0</version>
+    <version>0.1.1</version>
 </dependency>
 ```
 
 SDK 运行时仅依赖 Jackson；HTTP/WebSocket 使用 JDK。SDK 不携带日志绑定或全局日志配置。全仓 `mvn clean verify` 同时验证旧 Demo，需要其原有依赖。
+
+## 房间数据查询（0.1.1新增）
+
+以下API自0.1.1提供，0.1.0不包含这些接口。Maven依赖使用上方的`io.github.wujiiii:huya-connect-sdk:0.1.1`，Java包名不变。
+
+核心组注册成功后，SDK自动执行以下查询；每次重连重新查询。`start()`仍只等待核心组注册，不等待这些查询完成。
+
+| 方法 | 结果口径 |
+| --- | --- |
+| `refreshFanClubMembers()` | `getFansScoreRankPanel.lTotalFansNum`：主播粉丝团成员总数，不是榜单长度或在线人数 |
+| `refreshGuardianCount()` | `getGuardianCount.iCount`：当前有效守护总数，后续URI6249以iCount整体替换，不累加开通通知 |
+| `refreshFollowerCount()` | 匿名只读HTTP关注人数查询，不等待URI3102；后续3102整体替换缓存 |
+| `refreshLiveStatus()` | `getLivingInfo`：直播/未播/未知、回放标记、场次ID及开播时间原值 |
+| `refreshGiftCatalog()` | 复用`getResourceInfo`完整资源响应，解析礼物ID、iPropsType、名称和目录价格原值；不重复发初始化目录请求 |
+
+这些方法均返回`CompletableFuture<HuyaQueryResult<T>>`，同一连接上同类查询同时进行时复用在途请求。默认10秒超时，可用builder的`queryTimeout(Duration)`调整；查询失败不会导致SDK为了查询而重连，也不会阻塞实时接收。future续接任务不在SDK保活/控制线程完成，但耗时业务仍应自行使用业务执行器。
+
+```java
+try (HuyaClient client = HuyaClient.builder(roomId)
+        .presenterUid(verifiedPresenterUid)
+        .listener(listener)
+        .queryTimeout(java.time.Duration.ofSeconds(10))
+        .build()) {
+    client.start().get(60, TimeUnit.SECONDS);
+
+    var fans = client.refreshFanClubMembers().get(15, TimeUnit.SECONDS);
+    if (fans.successful()) {
+        Long memberCount = fans.value(); // 真实0保留为0；失败/缺字段不填0
+        System.out.println(memberCount);
+    } else {
+        System.err.println(fans.outcome() + ": " + fans.detail());
+    }
+
+    var guardians = client.refreshGuardianCount().get(15, TimeUnit.SECONDS);
+    var followers = client.refreshFollowerCount().get(15, TimeUnit.SECONDS);
+    if (guardians.successful()) System.out.println("当前守护总数：" + guardians.value());
+    if (followers.successful()) System.out.println("关注总人数：" + followers.value());
+
+    var live = client.refreshLiveStatus().get(15, TimeUnit.SECONDS);
+    if (live.successful()) {
+        System.out.println(live.value().state()); // LIVE / OFFLINE / UNKNOWN
+        System.out.println(live.value().replay()); // true / false / null
+        System.out.println(live.value().liveId()); // 十进制字符串；离线可能为"0"
+        System.out.println(live.value().startTimeEpochSeconds()); // 原始整数秒，缺失为null
+    }
+
+    var directory = client.refreshGiftCatalog().get(15, TimeUnit.SECONDS);
+    if (directory.successful()) {
+        HuyaRoomInfo.GiftItem gift = directory.value().gifts().get(giftId);
+        Integer propsType = gift == null ? null : gift.iPropsType(); // 未知不能当作类型0
+        System.out.println(propsType);
+        System.out.println(directory.receivedAt());
+        System.out.println(directory.responseSha256());
+        // directory.evidence()为原始HuyaEvent.Snapshot，保留请求ID、完整响应及raw()
+    }
+}
+```
+
+`roomInfo()`返回最近观察的不可变快照，包括`fanClubMembers`、`guardianCount`、`followerCount`、`liveStatus`和`giftCatalog`，各项均为`HuyaQueryResult`。新建、断连、重连及关闭时清为明确未知，避免把旧连接的数据当作新状态。
+
+每个结果包含`presenterUid`、`connectionId`、`requestId`、`requestedAt`、`receivedAt`、`outcome`、`value`、`detail`、`responseSha256`和`evidence`。`SUCCESS`表示该查询值可读取；`UNKNOWN`或`FAILED`的value为null。尚无响应时receivedAt为null；requestedAt仍保留实际请求发起时间。未连接或已关闭时主动刷新直接返回UNKNOWN，不悬挂。HTTP关注数保留响应字节SHA-256，evidence为空；WUP查询保留原Snapshot。推送更新的requestId为空，evidence为原Message。
+
+直播查询的`LiveInfo`中，`state`为`LIVE/OFFLINE/UNKNOWN`，`replay`为独立可空标志。回放不报告为LIVE；缺回放标记且协议表示正在播时，state为UNKNOWN。`liveId`保持十进制字符串，`startTimeEpochSeconds`保持协议整数秒；离线响应中的`"0"`场次ID和0开播时间原值不伪装成有效新场次，缺字段为null。实时开/下播仍读取既有Live事件的`message().fields()`，不增加重复业务事件。该查询缓存通过启动、重连或主动刷新更新。
+
+旧连接的迟到WUP/HTTP响应不能更新新连接缓存；查询超时后的迟到响应不覆盖结果。在途查询之前已经发起、但之后收到更新的关注/守护推送时，该查询的迟到结果仍可供其future读取，但不覆盖较新的推送缓存。
+
+目录只接受`iRetCode=0`且`iAllResource=1`的完整响应；失败或增量响应不冒充完整目录。礼物ID使用十进制字符串，iPropsType缺失时为null；保留每个礼物的原始JCE字段以及整份响应证据和哈希。SDK不按名称猜类型，不实施梦想值、收益、业务去重、每日汇总或提醒规则，超粉查询不在本次范围。
 
 ## 持续采集1995和童锦程【798】
 
@@ -219,4 +286,4 @@ $events | Where-Object type -eq 'gift' | Group-Object { $_.data.giftName } | Sel
 
 ## 发布
 
-SDK采用Apache-2.0。发布配置见[发布说明](docs/publishing.md)。公开源码不包含正式录制、运行快照和个人研究数据。
+SDK采用Apache-2.0。发布配置见[发布说明](docs/publishing.md)，新增房间查询的口径与验证见[查询验证说明](docs/sdk-room-queries.md)。公开源码不包含正式录制、运行快照和个人研究数据。

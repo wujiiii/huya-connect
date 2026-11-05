@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.List;
+import java.util.EnumMap;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -50,10 +51,12 @@ public final class HuyaClient implements AutoCloseable {
     private long sequence;
     private int failures;
     private boolean launched;
+    private final EnumMap<RoomQueries.Kind, HuyaQueryResult<?>> roomValues = new EnumMap<>(RoomQueries.Kind.class);
 
     private HuyaClient(Builder builder) throws IOException {
         options = builder.copy(); presenterUid = options.presenterUid;
         status = new HuyaStatus(State.NEW, options.roomId, presenterUid, null, Instant.now(), "created");
+        resetRoomInfo(null, "Not queried");
         recorder = options.directory == null ? null : new Recording(options.directory);
         callbacks = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS,
                 new ArrayBlockingQueue<>(options.capacity), action -> {
@@ -76,6 +79,129 @@ public final class HuyaClient implements AutoCloseable {
         return started.copy();
     }
     public HuyaStatus status() { return status; }
+    @SuppressWarnings("unchecked")
+    public synchronized HuyaRoomInfo roomInfo() {
+        return new HuyaRoomInfo((HuyaQueryResult<Long>) roomValues.get(RoomQueries.Kind.FAN_CLUB),
+                (HuyaQueryResult<Long>) roomValues.get(RoomQueries.Kind.GUARDIANS),
+                (HuyaQueryResult<Long>) roomValues.get(RoomQueries.Kind.FOLLOWERS),
+                (HuyaQueryResult<HuyaRoomInfo.LiveInfo>) roomValues.get(RoomQueries.Kind.LIVE),
+                (HuyaQueryResult<HuyaRoomInfo.GiftCatalog>) roomValues.get(RoomQueries.Kind.GIFTS));
+    }
+    public CompletableFuture<HuyaQueryResult<Long>> refreshFanClubMembers() { return query(RoomQueries.Kind.FAN_CLUB); }
+    public CompletableFuture<HuyaQueryResult<Long>> refreshGuardianCount() { return query(RoomQueries.Kind.GUARDIANS); }
+    public CompletableFuture<HuyaQueryResult<Long>> refreshFollowerCount() { return query(RoomQueries.Kind.FOLLOWERS); }
+    public CompletableFuture<HuyaQueryResult<HuyaRoomInfo.LiveInfo>> refreshLiveStatus() { return query(RoomQueries.Kind.LIVE); }
+    public CompletableFuture<HuyaQueryResult<HuyaRoomInfo.GiftCatalog>> refreshGiftCatalog() { return query(RoomQueries.Kind.GIFTS); }
+
+    private synchronized void resetRoomInfo(Connection c, String detail) {
+        for (RoomQueries.Kind kind : RoomQueries.Kind.values())
+            roomValues.put(kind, new HuyaQueryResult<>(presenterUid, c == null ? null : c.id, null, null, null,
+                    HuyaQueryResult.Outcome.UNKNOWN, null, detail, null, null));
+    }
+    @SuppressWarnings("unchecked")
+    private synchronized <T> CompletableFuture<HuyaQueryResult<T>> query(RoomQueries.Kind kind) {
+        Connection c = current;
+        if (stopped || c == null || !c.registered)
+            return CompletableFuture.completedFuture(new HuyaQueryResult<>(presenterUid, c == null ? null : c.id,
+                    null, Instant.now(), null, HuyaQueryResult.Outcome.UNKNOWN, null,
+                    stopped ? "Client closed" : "Core groups not registered", null, null));
+        Pending existing = c.pending.get(kind);
+        if (existing != null) return (CompletableFuture<HuyaQueryResult<T>>) (CompletableFuture<?>) existing.future.copy();
+        return (CompletableFuture<HuyaQueryResult<T>>) (CompletableFuture<?>) beginQuery(c, kind, c.nextRequest++).future.copy();
+    }
+    private synchronized Pending beginQuery(Connection c, RoomQueries.Kind kind, int requestId) {
+        Pending p = new Pending(kind, requestId); c.pending.put(kind, p);
+        try { control.execute(() -> sendQuery(c, p)); }
+        catch (RejectedExecutionException e) { finishQuery(c, p, null, "Query scheduling closed", null, null, HuyaQueryResult.Outcome.UNKNOWN); }
+        return p;
+    }
+    private synchronized void sendQuery(Connection c, Pending p) {
+        if (stopped || current != c || c.pending.get(p.kind) != p) return;
+        try { sendQueryRequest(c, p); }
+        catch (RuntimeException e) { finishQuery(c, p, null, "Query request could not be sent", null, null, HuyaQueryResult.Outcome.FAILED); }
+    }
+    private void sendQueryRequest(Connection c, Pending p) {
+        if (p.kind != RoomQueries.Kind.FOLLOWERS) {
+            send(c, RoomQueries.request(p.kind, c.guid, presenterUid, options.roomId, p.id));
+            return;
+        }
+        URI uri = URI.create(options.followerEndpoint + "?from_key=0&from_type=1&to_key=" + presenterUid + "&to_type=2");
+        HttpRequest request = HttpRequest.newBuilder(uri).timeout(Duration.ofMillis(options.queryTimeoutMillis))
+                .header("User-Agent", "Mozilla/5.0").GET().build();
+        p.http = http.sendAsync(request, ignored -> new LimitedBody());
+        p.http.whenComplete((response, error) -> execute(() -> {
+            Object value = null; String failure = null, sha = null;
+            try {
+                if (error != null) throw new IOException("Follower HTTP query failed");
+                sha = RoomQueries.sha256(response.body());
+                if (response.statusCode() != 200) throw new IOException("Follower HTTP status " + response.statusCode());
+                value = RoomQueries.followers(response.body());
+            } catch (IOException | RuntimeException e) { failure = e.getMessage(); }
+            finishQuery(c, p, value, failure, sha, null,
+                    failure == null ? HuyaQueryResult.Outcome.SUCCESS : HuyaQueryResult.Outcome.FAILED);
+        }));
+    }
+    private synchronized void queryResponse(Connection c, HuyaEvent.Snapshot snapshot) {
+        if (stopped || current != c) return;
+        Pending pending = null;
+        for (Pending p : c.pending.values()) if (Integer.toString(p.id).equals(snapshot.requestId())) { pending = p; break; }
+        if (pending == null) return;
+        Object value = null; String failure = null;
+        try { value = RoomQueries.parse(pending.kind, snapshot, presenterUid); }
+        catch (RuntimeException e) { failure = e.getMessage(); }
+        finishQuery(c, pending, value, failure, RoomQueries.sha256(snapshot.raw().payload()), snapshot,
+                failure == null ? HuyaQueryResult.Outcome.SUCCESS : HuyaQueryResult.Outcome.FAILED);
+    }
+    private synchronized void finishQuery(Connection c, Pending p, Object value, String detail, String sha,
+                                          HuyaEvent evidence, HuyaQueryResult.Outcome outcome) {
+        if (current != c || c.pending.get(p.kind) != p) return;
+        c.pending.remove(p.kind);
+        Instant receivedAt = evidence != null ? evidence.raw().receivedAt() : sha != null ? Instant.now() : null;
+        var result = new HuyaQueryResult<>(presenterUid, c.id, Integer.toString(p.id), p.at, receivedAt, outcome,
+                value, detail, sha, evidence);
+        HuyaQueryResult<?> old = roomValues.get(p.kind);
+        // A query sent before a newer push must not overwrite that push on delayed completion.
+        if (!(old.evidence() instanceof HuyaEvent.Message) || !old.receivedAt().isAfter(p.at)) roomValues.put(p.kind, result);
+        p.future.completeAsync(() -> result);
+    }
+    private synchronized void timeoutQueries(Connection c) {
+        for (Pending p : List.copyOf(c.pending.values())) {
+            if (elapsed(System.nanoTime(), p.created) > options.queryTimeoutMillis) {
+                finishQuery(c, p, null, "Query timeout", null, null, HuyaQueryResult.Outcome.FAILED);
+                if (p.http != null) p.http.cancel(true);
+            }
+        }
+    }
+    private synchronized void cancelQueries(Connection c, String detail) {
+        if (c == null) return;
+        for (Pending p : List.copyOf(c.pending.values())) {
+            var result = new HuyaQueryResult<>(presenterUid, c.id, Integer.toString(p.id), p.at, null,
+                    HuyaQueryResult.Outcome.UNKNOWN, null, detail, null, null);
+            p.future.completeAsync(() -> result);
+            if (p.http != null) p.http.cancel(true);
+        }
+        c.pending.clear();
+    }
+    private synchronized void roomPush(Connection c, HuyaEvent.Message message) {
+        if (stopped || current != c || !c.registered || message.decodeError() != null) return;
+        RoomQueries.Kind kind; Object value;
+        try {
+            if (message.uri() == 3102 && presenterUid.equals(message.fields().get("pid"))) {
+                kind = RoomQueries.Kind.FOLLOWERS; value = message.fields().get("subscribe_count");
+            } else if (message.uri() == 6249 && (message.group().isEmpty() || message.group().equals("live:" + presenterUid)
+                    || message.group().equals("chat:" + presenterUid) || message.group().equals("comm:vipbar_" + presenterUid))) {
+                kind = RoomQueries.Kind.GUARDIANS; value = RoomQueries.count(message.jce(), 0);
+            } else return;
+        } catch (RuntimeException e) { return; } // Original malformed message/error remains available to the listener.
+        roomValues.put(kind, new HuyaQueryResult<>(presenterUid, c.id, null, null, message.raw().receivedAt(),
+                HuyaQueryResult.Outcome.SUCCESS, value, "Push update", RoomQueries.sha256(message.raw().payload()), message));
+    }
+    private static final class Pending {
+        final RoomQueries.Kind kind; final int id; final Instant at = Instant.now(); final long created = System.nanoTime();
+        final CompletableFuture<HuyaQueryResult<Object>> future = new CompletableFuture<>();
+        CompletableFuture<HttpResponse<byte[]>> http;
+        Pending(RoomQueries.Kind kind, int id) { this.kind = kind; this.id = id; }
+    }
 
     private void connect() {
         if (stopped) return;
@@ -83,7 +209,7 @@ public final class HuyaClient implements AutoCloseable {
         try {
             if (presenterUid == null) presenterUid = resolve();
             if (stopped) return;
-            var connection = new Connection(); current = connection;
+            var connection = new Connection(); current = connection; resetRoomInfo(connection, "New connection; not queried");
             URI endpoint = options.endpoints.get(failures % options.endpoints.size());
             http.newWebSocketBuilder().connectTimeout(Duration.ofSeconds(15))
                     .header("Origin", "https://www.huya.com")
@@ -117,6 +243,7 @@ public final class HuyaClient implements AutoCloseable {
             Connection c = current;
             if (stopped || c == null || c.socket == null) return;
             long now = System.nanoTime();
+            timeoutQueries(c);
             if (!c.registered && elapsed(now, c.opened) > options.registrationMillis)
                 recover(c, new IOException("Core registration timeout"));
             else if (elapsed(now, c.lastResponse) > options.receiveMillis)
@@ -151,6 +278,9 @@ public final class HuyaClient implements AutoCloseable {
                         c.lastResponse = System.nanoTime();
                         if (command.opcode() == 17) execute(() -> registration(c, command));
                     }
+                    if (event instanceof HuyaEvent.Snapshot snapshot) execute(() -> queryResponse(c, snapshot));
+                    if (event instanceof HuyaEvent.Message message && (message.uri() == 3102 || message.uri() == 6249))
+                        execute(() -> roomPush(c, message));
                 }
             }
             dispatch(() -> {
@@ -160,7 +290,7 @@ public final class HuyaClient implements AutoCloseable {
         } catch (IOException e) { terminate(State.FAILED, new IOException("Recording failed", e)); }
         catch (RuntimeException e) { terminate(State.FAILED, e); }
     }
-    private void registration(Connection c, HuyaEvent.Command command) {
+    private synchronized void registration(Connection c, HuyaEvent.Command command) {
         if (stopped || current != c) return;
         try {
             List<Field> ack = Jce.decode(bytes(command.jce(), 1));
@@ -176,14 +306,15 @@ public final class HuyaClient implements AutoCloseable {
             started.completeAsync(() -> null);
             byte[] user = Protocol.user(c.guid);
             send(c, Protocol.wup("getLiveRoomActivityBanner", concat(user, integer(1, Long.parseLong(presenterUid))), 100));
-            send(c, Protocol.wup("getResourceInfo", concat(user, string(1, "web"), string(2, ""),
-                    integer(3, Long.parseLong(presenterUid))), 101));
+            beginQuery(c, RoomQueries.Kind.GIFTS, 101);
+            for (RoomQueries.Kind kind : RoomQueries.Kind.values())
+                if (kind != RoomQueries.Kind.GIFTS) beginQuery(c, kind, c.nextRequest++);
         } catch (RuntimeException e) { recover(c, new IOException("Invalid registration response")); }
     }
-    private void recover(Connection c, Throwable error) {
+    private synchronized void recover(Connection c, Throwable error) {
         if (stopped || current != c) return;
         if (c != null && c.registered && elapsed(System.nanoTime(), c.opened) >= 180_000) failures = 0;
-        current = null;
+        cancelQueries(c, "Connection changed"); current = null; resetRoomInfo(null, "Connection unavailable");
         if (c != null && c.socket != null) c.socket.abort();
         failures++;
         dispatch(() -> report(error));
@@ -216,6 +347,8 @@ public final class HuyaClient implements AutoCloseable {
     private synchronized void terminate(State state, Throwable error) {
         if (stopped) return;
         stopped = true; terminalError = error;
+        cancelQueries(current, "Client closed");
+        resetRoomInfo(null, "Client closed");
         if (current != null && current.socket != null) current.socket.abort();
         control.shutdownNow();
         try { if (recorder != null) recorder.close(); }
@@ -264,7 +397,9 @@ public final class HuyaClient implements AutoCloseable {
         final StringBuilder text = new StringBuilder();
         volatile WebSocket socket;
         volatile long opened, lastResponse, lastHeartbeat;
-        boolean registered;
+        volatile boolean registered;
+        int nextRequest = 1000;
+        final EnumMap<RoomQueries.Kind, Pending> pending = new EnumMap<>(RoomQueries.Kind.class);
         CompletableFuture<Void> outgoing = CompletableFuture.completedFuture(null);
         @Override public void onOpen(WebSocket socket) {
             this.socket = socket;
@@ -312,6 +447,8 @@ public final class HuyaClient implements AutoCloseable {
         private long tickMillis = 1000, backoffMillis = 2000;
         private int maxMessageBytes = 64 * 1024 * 1024;
         private boolean jitter = true;
+        private long queryTimeoutMillis = 10_000;
+        private URI followerEndpoint = URI.create("https://api.huya.com/subscribe/getSubscribeStatus");
         private Builder(String roomId) {
             if (roomId == null || !roomId.matches("[1-9][0-9]{0,18}")) throw new IllegalArgumentException("Numeric room ID required");
             this.roomId = roomId;
@@ -327,6 +464,12 @@ public final class HuyaClient implements AutoCloseable {
             if (capacity < 1) throw new IllegalArgumentException("Positive callback capacity required");
             this.capacity = capacity; return this;
         }
+        public Builder queryTimeout(Duration timeout) {
+            long millis = java.util.Objects.requireNonNull(timeout).toMillis();
+            if (millis < 1) throw new IllegalArgumentException("Positive query timeout required");
+            queryTimeoutMillis = millis; return this;
+        }
+        Builder followerEndpoint(URI endpoint) { followerEndpoint = endpoint; return this; }
         // Package-private transport/timing overrides keep tests local without opening an arbitrary command API.
         Builder transport(List<URI> endpoints, long heartbeat, long registration, long receive) {
             this.endpoints = List.copyOf(endpoints); heartbeatMillis = heartbeat; registrationMillis = registration;
@@ -336,7 +479,8 @@ public final class HuyaClient implements AutoCloseable {
             Builder b = new Builder(roomId); b.presenterUid = presenterUid; b.listener = listener; b.directory = directory;
             b.capacity = capacity; b.endpoints = endpoints; b.heartbeatMillis = heartbeatMillis;
             b.registrationMillis = registrationMillis; b.receiveMillis = receiveMillis; b.tickMillis = tickMillis;
-            b.backoffMillis = backoffMillis; b.maxMessageBytes = maxMessageBytes; b.jitter = jitter; return b;
+            b.backoffMillis = backoffMillis; b.maxMessageBytes = maxMessageBytes; b.jitter = jitter;
+            b.queryTimeoutMillis = queryTimeoutMillis; b.followerEndpoint = followerEndpoint; return b;
         }
         public HuyaClient build() throws IOException { return new HuyaClient(this); }
     }

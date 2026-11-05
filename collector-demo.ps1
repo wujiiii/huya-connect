@@ -146,7 +146,7 @@ function Start-Collector([string]$Root, [switch]$ReuseRuntime, [switch]$NoWatchd
                 & mvn -q -f collector-demo/pom.xml dependency:copy-dependencies '-DincludeScope=runtime'
                 if ($LASTEXITCODE -ne 0) { throw 'SDK Demo 依赖准备失败' }
             } finally { Pop-Location }
-            $jars = @((Get-Item -LiteralPath (Join-Path $collectorProject 'collector-demo/target/huya-collector-demo-0.1.0.jar')))
+            $jars = @((Get-Item -LiteralPath (Join-Path $collectorProject 'collector-demo/target/huya-collector-demo-0.1.1.jar')))
             $jars += @(Get-ChildItem -LiteralPath (Join-Path $collectorProject 'collector-demo/target/dependency') -Filter '*.jar' -File)
         }
         $launchId = [DateTimeOffset]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0,8)

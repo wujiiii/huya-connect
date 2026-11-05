@@ -1,12 +1,12 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
-  <groupId>io.github.wujiiii</groupId><artifactId>huya-connect-parent</artifactId><version>0.1.0</version><packaging>pom</packaging>
+  <groupId>io.github.wujiiii</groupId><artifactId>huya-connect-parent</artifactId><version>0.1.1</version><packaging>pom</packaging>
   <name>huya-connect</name>
   <description>Standalone Java 17 SDK for anonymous read-only Huya live-room data collection.</description>
   <url>https://github.com/wujiiii/huya-connect</url>
   <licenses><license><name>The Apache License, Version 2.0</name><url>https://www.apache.org/licenses/LICENSE-2.0.txt</url><distribution>repo</distribution></license></licenses>
   <developers><developer><id>wujiiii</id><name>wujiiii</name><url>https://github.com/wujiiii</url></developer></developers>
-  <scm><connection>scm:git:https://github.com/wujiiii/huya-connect.git</connection><developerConnection>scm:git:ssh://git@github.com/wujiiii/huya-connect.git</developerConnection><url>https://github.com/wujiiii/huya-connect</url><tag>v0.1.0</tag></scm>
+  <scm><connection>scm:git:https://github.com/wujiiii/huya-connect.git</connection><developerConnection>scm:git:ssh://git@github.com/wujiiii/huya-connect.git</developerConnection><url>https://github.com/wujiiii/huya-connect</url><tag>v0.1.1</tag></scm>
   <modules><module>sdk</module><module>legacy-demo</module><module>collector-demo</module></modules>
   <properties><maven.compiler.release>17</maven.compiler.release><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding></properties>
   <build><plugins>
